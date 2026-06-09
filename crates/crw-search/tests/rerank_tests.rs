@@ -391,8 +391,140 @@ fn transform_flat_reranked_smoke() {
             resolution: None,
         },
     ];
-    let out = crw_search::transform_flat_reranked(&resp(rows), "best restaurants in belgrade", 5);
+    let out =
+        crw_search::transform_flat_reranked(&resp(rows), "best restaurants in belgrade", 5, false);
     assert_eq!(out.len(), 1, "junk dictionary row must be dropped");
     assert!(out[0].url.contains("tripadvisor"));
     assert_eq!(out[0].position, 1);
+}
+
+/// Builder for a minimal result row (only the fields the rerank pipeline reads).
+fn make_row(url: &str, title: &str, content: &str, score: f64) -> SearxngResult {
+    SearxngResult {
+        url: Some(url.into()),
+        title: Some(title.into()),
+        engine: Some("bing".into()),
+        content: Some(content.into()),
+        score: Some(score),
+        engines: vec!["bing".into()],
+        positions: vec![1],
+        category: Some("general".into()),
+        template: None,
+        published_date: None,
+        img_src: None,
+        thumbnail_src: None,
+        img_format: None,
+        resolution: None,
+    }
+}
+
+#[test]
+fn relevance_gate_keeps_full_match_and_drops_zero_coverage() {
+    // The relevance gate keeps rows within ONE important term of the pool
+    // maximum (softened from the old hard `== max_cov`, so a single
+    // keyword-stuffed spam row can't evict a strong near-match). It must still
+    // drop rows that cover ZERO important terms, using only the query's own
+    // tokens (no geo signal — works on any self-hosted region).
+    let rows = vec![
+        // Zero-coverage row: neither "pizza" nor "belgrade" present.
+        make_row(
+            "https://www.example.com/cooking",
+            "How To Bake Sourdough Bread At Home",
+            "a long guide on baking bread from scratch in your oven",
+            9.0,
+        ),
+        // Genuine answer: both "pizza" and "belgrade" present (coverage 2/2).
+        make_row(
+            "https://www.tripadvisor.com/Restaurants-Belgrade-Pizza.html",
+            "THE 10 BEST Pizza Places in Belgrade",
+            "best pizza in belgrade serbia — top pizzerias",
+            6.0,
+        ),
+    ];
+    let q = "best pizza in the belgrade";
+
+    // Relevance gate (flag on): the zero-coverage bread row is dropped; only the
+    // Belgrade row (coverage 2/2, the max) reaches the LLM.
+    let on = crw_search::transform_flat_reranked(&resp(rows), q, 5, true);
+    assert_eq!(
+        on.len(),
+        1,
+        "relevance gate must drop the zero-coverage row"
+    );
+    assert!(
+        on[0].url.contains("tripadvisor") && on[0].url.to_lowercase().contains("belgrade"),
+        "expected the Belgrade pizza row, got: {:?}",
+        on[0].url
+    );
+}
+
+#[test]
+fn relevance_gate_evicts_partial_match_homonym() {
+    // Hard gate: only MAX-coverage rows survive. The genuine Belgrade match
+    // (covers both "pizza" and "belgrade") evicts the pizza-only homonym
+    // (covers one term) — keeping the wrong-context result out of the pool,
+    // which is the feature's purpose. The homonym is given a HIGHER raw score
+    // to prove the gate evicts by coverage regardless of upstream rank.
+    let rows = vec![
+        // Full match: covers both "pizza" and "belgrade" (coverage 2/2).
+        make_row(
+            "https://belgrade-eats.example/pizza",
+            "Best Pizza in Belgrade — Top Pizzerias",
+            "a guide to the best pizza places across belgrade, serbia",
+            6.0,
+        ),
+        // Partial homonym: covers "pizza" only, no "belgrade" (coverage 1/2);
+        // higher raw score, but the gate still evicts it.
+        make_row(
+            "https://www.seriouseats.com/best-pizza-guide",
+            "The Definitive Guide To Great Pizza",
+            "an in-depth, well-researched look at what makes pizza great",
+            9.0,
+        ),
+    ];
+    let q = "best pizza in the belgrade";
+
+    let on = crw_search::transform_flat_reranked(&resp(rows), q, 5, true);
+    assert_eq!(
+        on.len(),
+        1,
+        "only the full-coverage Belgrade row should survive the gate"
+    );
+    assert!(
+        on.iter().any(|r| r.url.contains("belgrade-eats")),
+        "the full-match row must survive: {:?}",
+        on.iter().map(|r| &r.url).collect::<Vec<_>>()
+    );
+    assert!(
+        !on.iter().any(|r| r.url.contains("seriouseats")),
+        "the pizza-only homonym must be evicted by the hard max-coverage gate"
+    );
+}
+
+#[test]
+fn relevance_gate_is_degrade_safe_when_no_full_match() {
+    // When NO row covers more terms than the others (here every row matches
+    // only "pizza", none match "belgrade"), the gate must not empty the pool —
+    // it degrades to the same set the default path would return.
+    let rows = vec![
+        make_row(
+            "https://example-a.com/pizza",
+            "Great Pizza Places",
+            "pizza near you",
+            9.0,
+        ),
+        make_row(
+            "https://example-b.com/pizza",
+            "More Pizza Spots",
+            "pizza delivery",
+            5.0,
+        ),
+    ];
+    let q = "best pizza in the belgrade";
+    let on = crw_search::transform_flat_reranked(&resp(rows), q, 5, true);
+    assert_eq!(
+        on.len(),
+        2,
+        "relevance gate must never empty a non-empty pool when there is no strictly-better-covered row"
+    );
 }
