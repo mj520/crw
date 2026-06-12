@@ -203,6 +203,36 @@ pub struct SearchConfig {
     /// no-source cases). Default false; A/B with an INCORRECT-guard before flip.
     #[serde(default)]
     pub answer_calibrated: bool,
+    /// Moat-hardening abstention (gated). Appends a clause making the answer
+    /// model (a) REJECT a false/unverifiable premise instead of answering as
+    /// though it were true, (b) report when sources CONFLICT rather than picking
+    /// one confidently, and (c) abstain when not confident. Targets the
+    /// adversarial failure SealQA Seal-0 exposed: 32% confident-WRONG
+    /// (hallucination) on conflicting-source / false-premise questions, where
+    /// the "use ONLY sources" rule alone is insufficient. Complements (does not
+    /// replace) `answer_calibrated`. Default false; A/B requires Seal-0
+    /// hallucination DOWN with SimpleQA accuracy NOT regressed before flip.
+    #[serde(default)]
+    pub answer_guarded: bool,
+    /// Use SearXNG structured sources (gated, W0). SearXNG's `infoboxes[]` /
+    /// `answers[]` arrays carry Wikidata/Wikipedia knowledge-panel facts
+    /// (entity attributes like religion/capital/director) that the `results[]`
+    /// transform path discards. With this on, those facts are parsed and pinned
+    /// as a high-trust source at the FRONT of the answer pool (still
+    /// UNTRUSTED-wrapped — widens evidence, never bypasses the safety wrapper).
+    /// Targets the obscure-entity recall gap (PopQA). Default false; A/B on
+    /// diag500 gold-in-sources with the wrong-non-abstain invariant before flip.
+    #[serde(default)]
+    pub use_structured_sources: bool,
+    /// Deterministic Wikidata entity-relation lookup (gated, W3). For
+    /// `<relation> of <entity>` questions (PopQA's obscure long tail that web
+    /// search can't surface), classify -> wbsearchentities -> property fetch and
+    /// pin the fact as a structured source (UNTRUSTED-wrapped, runs in parallel
+    /// with SearXNG, 3s-bounded, any error falls through). Free open data, no
+    /// AI, no SPARQL hot-path. Default false; A/B on diag500 PopQA accuracy +
+    /// the wrong-non-abstain invariant before flip.
+    #[serde(default)]
+    pub wikidata_lookup: bool,
     /// Snippet fallback for the LLM answer path (gated): when a top-N result's
     /// scrape failed (empty `markdown`), the result is normally dropped from the
     /// answer pool — if it was the answer-bearing page, crw abstains though
@@ -231,6 +261,9 @@ impl Default for SearchConfig {
             passage_select: false,
             page2_fallback: false,
             answer_calibrated: false,
+            answer_guarded: false,
+            use_structured_sources: false,
+            wikidata_lookup: false,
             snippet_fallback: false,
         }
     }

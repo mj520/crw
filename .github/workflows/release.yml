@@ -167,7 +167,22 @@ jobs:
 
       - name: Install cross (Linux ARM only)
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        # Retry: `cargo install cross` builds from source and pulls crates from
+        # the network; a single transient curl/HTTP2 hiccup (e.g. "Error in the
+        # HTTP2 framing layer") otherwise fails the whole arm64 binary and
+        # cascades to skip asset-gate -> pypi/npm/apt/homebrew. 3 attempts with
+        # backoff turn a flaky download into a non-event.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo install cross --git https://github.com/cross-rs/cross; then
+              exit 0
+            fi
+            echo "::warning::cross install attempt ${attempt}/3 failed (transient network); retrying in $((attempt * 20))s"
+            sleep "$((attempt * 20))"
+          done
+          echo "::error::cross install failed after 3 attempts"
+          exit 1
 
       - name: Build
         shell: bash
@@ -259,6 +274,11 @@ jobs:
 
   publish-npm:
     needs: [release-context, asset-gate]
+    # Temporarily disable npm publishing by setting repo variable SKIP_NPM=true
+    # (e.g. while the npm token can't publish — 2FA-bypass granular token not yet
+    # configured). The job is cleanly SKIPPED (gray), not failed/masked. Clear
+    # the SKIP_NPM repo variable to re-enable. See RELEASE.md.
+    if: ${{ vars.SKIP_NPM != 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -436,7 +456,17 @@ jobs:
         run: mcp-publisher login github-oidc
 
       - name: Publish to MCP Registry
-        run: mcp-publisher publish
+        # The registry intermittently returns 5xx (504 seen on v0.13.2). Retry
+        # so a transient gateway error doesn't fail an otherwise-green release.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4; do
+            if mcp-publisher publish; then exit 0; fi
+            echo "::warning::mcp-publisher publish attempt ${attempt}/4 failed (transient registry error); retrying in $((attempt * 20))s"
+            sleep "$((attempt * 20))"
+          done
+          echo "::error::mcp-publisher publish failed after 4 attempts"
+          exit 1
 
       - name: Verify
         shell: bash
@@ -486,6 +516,10 @@ jobs:
       - publish-mcp-registry
       - update-apt
       - update-homebrew
+    # Run even when an optional publish job is skipped (e.g. publish-npm under
+    # SKIP_NPM) — `!cancelled()` lets verification report on whatever shipped
+    # instead of being skipped along with the gated job.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -498,6 +532,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SKIP_NPM: ${{ vars.SKIP_NPM }}
         run: |
           set -euo pipefail
           bash scripts/release/verify_publish.sh \

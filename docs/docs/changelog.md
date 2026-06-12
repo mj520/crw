@@ -8,6 +8,74 @@ The source of truth is the repository root changelog. Do not edit this docs page
 
 All notable changes to CRW are documented here.
 
+## [0.13.4](https://github.com/us/crw/compare/v0.13.3...v0.13.4) (2026-06-07)
+
+
+### Bug Fixes
+
+* **docker:** install aarch64 libc headers for cross-compile + CI guard ([8cd31ac](https://github.com/us/crw/commit/8cd31ac016177d3d2621e8ecfa03a027b1621a3a))
+
+## [0.13.3](https://github.com/us/crw/compare/v0.13.2...v0.13.3) (2026-06-06)
+
+
+### Bug Fixes
+
+* **release:** stop verify-publish reporting false failures ([d57c8c6](https://github.com/us/crw/commit/d57c8c6285a014031bcf310386e83493c7dcd2f2))
+
+
+### Performance
+
+* **docker:** cross-compile arm64 instead of QEMU (2h -&gt; ~3min) ([a7cab42](https://github.com/us/crw/commit/a7cab423d11fd8a7474c587796f86eacf2c32df9))
+
+## [0.13.2](https://github.com/us/crw/compare/v0.13.1...v0.13.2) (2026-06-06)
+
+
+### Bug Fixes
+
+* **server:** embed openapi spec inside the crate so it can publish ([e606cb9](https://github.com/us/crw/commit/e606cb9303cec3716b7dbffd4d848164486368ea))
+
+## [0.13.1](https://github.com/us/crw/compare/v0.13.0...v0.13.1) (2026-06-06)
+
+
+### Bug Fixes
+
+* **release:** correct publish tier ordering + guard topology ([c84deed](https://github.com/us/crw/commit/c84deedeeeb2698f50d94247b770560cd6f3d0df))
+
+## [0.13.0](https://github.com/us/crw/compare/v0.12.1...v0.13.0) (2026-06-06)
+
+
+### Features
+
+* **search:** deterministic Wikidata entity-relation lookup (W3) ([aa96e3e](https://github.com/us/crw/commit/aa96e3e182fad6d8e2caf03628461515ca5aab7f))
+
+
+### Bug Fixes
+
+* **release:** sync Cargo.lock internal crate versions to 0.12.1 ([b5fc8a5](https://github.com/us/crw/commit/b5fc8a5b988401bb2ecca6fdd3be328d1ccd683a))
+
+## [0.12.1](https://github.com/us/crw/compare/v0.12.0...v0.12.1) (2026-06-05)
+
+
+### Bug Fixes
+
+* **release:** bump internal dep pins and track them in release config ([0139ec2](https://github.com/us/crw/commit/0139ec247c7f328ef172646eac3de5e0f287c42a))
+* **release:** sync Cargo.lock with bumped internal dep versions ([5c89d60](https://github.com/us/crw/commit/5c89d6037e32435a49cfd4fbdf1c2ba05ad83ae8))
+
+## [0.12.0](https://github.com/us/crw/compare/v0.11.0...v0.12.0) (2026-06-05)
+
+
+### Features
+
+* **answer:** gated moat-hardening abstention (answer_guarded) ([7ef7f32](https://github.com/us/crw/commit/7ef7f32c085f4e01429b4afa6794c52836cdd4e6))
+* **mcp:** emit structuredContent for crw_search; bump protocol to 2025-06-18 ([0cd9a4f](https://github.com/us/crw/commit/0cd9a4fa0e338683b75c5719bc3c54cca3b2dba6)), closes [#89](https://github.com/us/crw/issues/89)
+* **search:** diagnose search config and name unreachable host ([#90](https://github.com/us/crw/issues/90)) ([25f9441](https://github.com/us/crw/commit/25f94410869e24cb79a7835e2f05627d0eb07351))
+* **search:** pin SearXNG infoboxes/answers as structured sources (W0) ([554f18c](https://github.com/us/crw/commit/554f18ce4747057a04ec64f9f983faf46a48dee2))
+
+
+### Bug Fixes
+
+* **search:** use resolvable searxng host in docker config ([#90](https://github.com/us/crw/issues/90)) ([d966021](https://github.com/us/crw/commit/d9660219d23bdd4364940c97c9911dd31e73567b))
+
 ## [0.11.0](https://github.com/us/crw/compare/v0.10.0...v0.11.0) (2026-06-03)
 
 

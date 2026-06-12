@@ -14,9 +14,12 @@
 pub mod client;
 pub mod params;
 pub mod rerank;
+pub mod structured;
 pub mod transform;
+pub mod wikidata;
 
 pub use client::{SearchError, SearxngClient, SearxngResponse, SearxngResult};
 pub use params::{SearxngParams, clean_query, map_to_searxng_params};
 pub use rerank::rerank;
+pub use structured::{StructuredFact, structured_facts};
 pub use transform::{transform_flat, transform_flat_reranked, transform_grouped};

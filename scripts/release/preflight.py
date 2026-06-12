@@ -34,6 +34,7 @@ Exits non-zero on any failure with `::error::` annotations for GitHub Actions.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tomllib
@@ -145,32 +146,46 @@ def collect_version_surfaces(ws_version: str) -> list[tuple[str, str, str]]:
         d = tomllib.loads(py.read_text())
         rows.append((str(py), ws_version, d.get("project", {}).get("version", "MISSING")))
 
-    # npm main + platform packages
+    # npm platform packages, discovered by globbing `npm/crw-mcp-*/package.json`
+    # (the main package `npm/crw-mcp` has no trailing `-` so it is excluded).
+    # Self-deriving: adding a platform needs NO edit here — the old hardcoded
+    # 6-tuples meant a 7th platform was silently unchecked.
+    platform_pkgs = sorted(Path("npm").glob("crw-mcp-*/package.json"))
+    disk_platforms = {p.parent.name for p in platform_pkgs}
+
+    # npm main package: version + every internal optionalDependencies pin, with
+    # the platform key set read from the manifest itself.
     npm_main = Path("npm/crw-mcp/package.json")
+    opt_platforms: set[str] = set()
     if npm_main.exists():
         d = json.loads(npm_main.read_text())
         rows.append((str(npm_main) + ":version", ws_version, d.get("version", "MISSING")))
-        opt = d.get("optionalDependencies", {})
-        for plat in (
-            "crw-mcp-darwin-x64", "crw-mcp-darwin-arm64",
-            "crw-mcp-linux-x64", "crw-mcp-linux-arm64",
-            "crw-mcp-win32-x64", "crw-mcp-win32-arm64",
-        ):
-            actual = opt.get(plat, "MISSING")
+        for dep, actual in sorted(d.get("optionalDependencies", {}).items()):
+            if not dep.startswith("crw-mcp-"):
+                continue
+            opt_platforms.add(dep)
             # Accept exact, ^v, ~v.
             if actual in (ws_version, f"^{ws_version}", f"~{ws_version}"):
                 continue
-            rows.append((f"{npm_main}:optionalDependencies.{plat}", ws_version, actual))
+            rows.append((f"{npm_main}:optionalDependencies.{dep}", ws_version, actual))
 
-    for plat in (
-        "crw-mcp-darwin-x64", "crw-mcp-darwin-arm64",
-        "crw-mcp-linux-x64", "crw-mcp-linux-arm64",
-        "crw-mcp-win32-x64", "crw-mcp-win32-arm64",
-    ):
-        pkg_json = Path(f"npm/{plat}/package.json")
-        if pkg_json.exists():
-            d = json.loads(pkg_json.read_text())
-            rows.append((str(pkg_json) + ":version", ws_version, d.get("version", "MISSING")))
+        # Cross-check: every platform package on disk must be listed in
+        # optionalDependencies (and vice-versa), so a new platform can't be
+        # half-wired and silently skipped.
+        for missing in sorted(disk_platforms - opt_platforms):
+            rows.append((
+                f"{npm_main}:optionalDependencies.{missing}", ws_version,
+                "MISSING (platform package exists on disk but not in optionalDependencies)",
+            ))
+        for extra in sorted(opt_platforms - disk_platforms):
+            rows.append((
+                f"{npm_main}:optionalDependencies.{extra}", "a platform package dir",
+                "MISSING (listed in optionalDependencies but no npm/<plat>/package.json)",
+            ))
+
+    for pkg_json in platform_pkgs:
+        d = json.loads(pkg_json.read_text())
+        rows.append((str(pkg_json) + ":version", ws_version, d.get("version", "MISSING")))
 
     # server.json (MCP registry)
     sj = Path("server.json")
@@ -230,6 +245,64 @@ def main() -> int:
             errors.append(
                 f"{pkg['name']}: default features transitively pull unpublished {sorted(bad)}; "
                 f"either publish those crates or remove from defaults."
+            )
+
+    # 3b. Tier topology: every internal dep must publish in an EARLIER tier.
+    #     Within a tier crates are assumed independent — the driver waits for
+    #     crates.io propagation only at tier boundaries, not between same-tier
+    #     crates. A same-tier (or later) dep means a crate tries to resolve a
+    #     sibling that isn't on the index yet, which aborts the crates.io
+    #     publish from that crate onward (this skipped renderer..mcp on 0.13.0).
+    tier_of = {c: t["order"] for t in manifest["tiers"] for c in t["crates"]}
+    for pkg in meta["packages"]:
+        name = pkg["name"]
+        if name not in tier_of:
+            continue
+        for dep in pkg.get("dependencies", []):
+            if dep.get("kind") not in (None, "build"):
+                continue
+            dn = dep["name"]
+            if dn in tier_of and tier_of[dn] >= tier_of[name]:
+                errors.append(
+                    f"tier ordering: {name} (tier {tier_of[name]}) depends on "
+                    f"{dn} (tier {tier_of[dn]}) — a dependency must publish in an "
+                    f"earlier tier; move {dn} up or {name} down in "
+                    f"release_manifest.toml."
+                )
+
+    # 3c. No published crate may include_str!/include_bytes! a path that escapes
+    #     its own directory — cargo publish only packages files INSIDE the crate,
+    #     so an out-of-crate include compiles locally but breaks the publish
+    #     verify build (this kept crw-server unpublishable: it embedded the
+    #     workspace-root docs/openapi.json via ../../../../).
+    inc_re = re.compile(r"include_(?:str|bytes)!\s*\(\s*\"([^\"]+)\"")
+    for member in sorted(published):
+        crate_dir = (Path("crates") / member).resolve()
+        if not crate_dir.is_dir():
+            continue
+        for rs in sorted(crate_dir.rglob("*.rs")):
+            for inc in inc_re.findall(rs.read_text()):
+                target = (rs.parent / inc).resolve()
+                try:
+                    target.relative_to(crate_dir)
+                except ValueError:
+                    errors.append(
+                        f"{rs.relative_to(crate_dir.parent.parent)}: include of "
+                        f"'{inc}' reaches outside the crate — it won't be in the "
+                        f"published .crate tarball; move the file inside "
+                        f"crates/{member}/."
+                    )
+
+    # 3d. Duplicated spec copies kept for publishability must not drift.
+    for a, b in [
+        ("docs/openapi.json", "crates/crw-server/openapi/openapi.json"),
+        ("docs/openapi-3.0.json", "crates/crw-server/openapi/openapi-3.0.json"),
+    ]:
+        pa, pb = Path(a), Path(b)
+        if pa.exists() and pb.exists() and pa.read_bytes() != pb.read_bytes():
+            errors.append(
+                f"{a} and {b} have drifted — the crate copy (published) must stay "
+                f"byte-identical to the docs-site copy. Re-sync them."
             )
 
     # 4. Path/git deps need version field

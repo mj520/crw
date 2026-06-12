@@ -187,12 +187,12 @@ pub async fn search_inner(
             .clamp(1, MAX_QUERY_EXPAND_VARIANTS);
         fetch_expanded(&client, &req.query, &params, llm, variants_n)
             .await
-            .map_err(|e| map_search_error(e, state.config.search.timeout_ms))?
+            .map_err(|e| map_search_error(e, state.config.search.timeout_ms, client.base_url()))?
     } else {
         client
             .fetch(&params)
             .await
-            .map_err(|e| map_search_error(e, state.config.search.timeout_ms))?
+            .map_err(|e| map_search_error(e, state.config.search.timeout_ms, client.base_url()))?
     };
 
     let has_sources = req.sources.as_ref().is_some_and(|s| !s.is_empty());
@@ -208,6 +208,34 @@ pub async fn search_inner(
     } else {
         SearchData::Flat(transform_flat(&response, limit))
     };
+
+    // W0: parse SearXNG's infoboxes[]/answers[] (Wikidata/Wikipedia structured
+    // facts the results[] transform discards) into pinned answer sources. Gated
+    // default-off; empty when the flag is off or no structured data was returned.
+    let mut structured_sources: Vec<answer::Source> = if state.config.search.use_structured_sources
+    {
+        crw_search::structured_facts(&response)
+            .into_iter()
+            .map(|f| {
+                let md = f.to_markdown();
+                (f.url, f.title, md)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // W3: deterministic Wikidata entity-relation lookup (gated, answer path).
+    // For `<relation> of <entity>` queries the obscure-entity long tail web
+    // search can't surface, resolve the fact via Wikidata and PIN it first.
+    // 3s-bounded + cached; any miss/error leaves the normal path untouched.
+    if state.config.search.wikidata_lookup
+        && llm_path
+        && let Some(f) = crw_search::wikidata::lookup(&req.query).await
+    {
+        let md = f.to_markdown();
+        structured_sources.insert(0, (f.url, f.title, md));
+    }
 
     // Page-2 fallback (gated, default-off): when the reranked clean pool came
     // back thinner than the answer needs (junk filter stripped a sparse first
@@ -367,6 +395,8 @@ pub async fn search_inner(
                         state.config.search.passage_select,
                         state.config.search.answer_calibrated,
                         state.config.search.snippet_fallback,
+                        state.config.search.answer_guarded,
+                        &structured_sources,
                     )
                     .await
                     {
@@ -432,6 +462,8 @@ pub async fn search_inner(
                                             state.config.search.passage_select,
                                             state.config.search.answer_calibrated,
                                             state.config.search.snippet_fallback,
+                                            state.config.search.answer_guarded,
+                                            &structured_sources,
                                         )
                                         .await
                                     && !is_abstention(&ans2)
@@ -663,6 +695,7 @@ async fn attach_result_summaries(
     (count, usages)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn synthesize_answer(
     req: &SearchRequest,
     data: &SearchData,
@@ -670,6 +703,9 @@ async fn synthesize_answer(
     passage_select: bool,
     calibrated: bool,
     snippet_fallback: bool,
+    guarded: bool,
+    // W0: structured facts (infoboxes/answers) to PIN at the front of the pool.
+    structured: &[answer::Source],
 ) -> Result<
     (
         String,
@@ -704,7 +740,7 @@ async fn synthesize_answer(
             None => return Err("no web results to synthesize from".into()),
         },
     };
-    let sources: Vec<answer::Source> = pool
+    let scraped: Vec<answer::Source> = pool
         .iter()
         .filter_map(|r| {
             if let Some(md) = r.markdown.as_ref() {
@@ -726,6 +762,14 @@ async fn synthesize_answer(
         })
         .take(top_n)
         .collect();
+    // W0: PIN structured facts (Wikidata/Wikipedia infobox/answers) at the front
+    // so the synthesizer sees them first. They are still UNTRUSTED-wrapped by
+    // `answer::synthesize` — this widens evidence, it does not bypass safety.
+    let sources: Vec<answer::Source> = if structured.is_empty() {
+        scraped
+    } else {
+        structured.iter().cloned().chain(scraped).collect()
+    };
     if sources.is_empty() {
         return Err("no results carry markdown to synthesize an answer from".into());
     }
@@ -740,6 +784,7 @@ async fn synthesize_answer(
             cap,
             req.answer_prompt.as_deref(),
             calibrated,
+            guarded,
         )
         .await
     } else {
@@ -750,6 +795,7 @@ async fn synthesize_answer(
             cap,
             req.answer_prompt.as_deref(),
             calibrated,
+            guarded,
         )
         .await
     }
@@ -826,7 +872,12 @@ fn validate_request(req: &SearchRequest, max_limit: u32) -> Result<(), CrwError>
     Ok(())
 }
 
-fn map_search_error(err: SearchError, timeout_ms: u64) -> CrwError {
+/// Map a transport/timeout/upstream `SearchError` onto the HTTP `CrwError`.
+/// `base_url` is the configured SearXNG URL; the transport (`target_unreachable`)
+/// arm names its **origin** (issue #90) so the operator sees *which* host failed
+/// — sanitized, so a credentialed URL never reaches the response. Timeouts keep
+/// `error_code: "timeout"`; the host is correlated via the startup log instead.
+fn map_search_error(err: SearchError, timeout_ms: u64, base_url: &str) -> CrwError {
     match err {
         SearchError::Timeout => CrwError::Timeout(timeout_ms),
         SearchError::Upstream { status, body } => CrwError::HttpError(format!(
@@ -836,7 +887,10 @@ fn map_search_error(err: SearchError, timeout_ms: u64) -> CrwError {
         SearchError::InvalidResponse(msg) => {
             CrwError::HttpError(format!("SearXNG returned invalid JSON: {msg}"))
         }
-        SearchError::Transport(msg) => CrwError::TargetUnreachable(format!("SearXNG: {msg}")),
+        SearchError::Transport(msg) => CrwError::TargetUnreachable(format!(
+            "SearXNG ({}): {msg}",
+            crate::diagnostics::sanitize_url_origin(base_url)
+        )),
     }
 }
 
@@ -1119,7 +1173,7 @@ mod tests {
     #[test]
     fn map_search_error_timeout_to_timeout() {
         assert!(matches!(
-            map_search_error(SearchError::Timeout, 7500),
+            map_search_error(SearchError::Timeout, 7500, "http://searxng:8080"),
             CrwError::Timeout(7500)
         ));
     }
@@ -1131,9 +1185,26 @@ mod tests {
             body: "down".into(),
         };
         assert!(matches!(
-            map_search_error(err, 5000),
+            map_search_error(err, 5000, "http://searxng:8080"),
             CrwError::HttpError(_)
         ));
+    }
+
+    #[test]
+    fn map_search_error_transport_names_sanitized_host() {
+        // issue #90: the unreachable error must name the configured host so the
+        // operator knows *what* failed — but origin-only, never the raw URL.
+        let err = SearchError::Transport("dns error: failed to lookup address".into());
+        let mapped = map_search_error(err, 5000, "https://user:pass@searxng:8080/tok?k=v");
+        match mapped {
+            CrwError::TargetUnreachable(msg) => {
+                assert!(msg.contains("https://searxng:8080"), "{msg}");
+                assert!(!msg.contains("user"), "must not leak userinfo: {msg}");
+                assert!(!msg.contains("pass"), "must not leak credentials: {msg}");
+                assert!(!msg.contains("tok"), "must not leak path token: {msg}");
+            }
+            other => panic!("expected TargetUnreachable, got {other:?}"),
+        }
     }
 
     #[test]
